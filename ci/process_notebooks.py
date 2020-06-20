@@ -12,13 +12,10 @@
 import os
 import sys
 import argparse
+import hashlib
+from binascii import a2b_base64
 import nbformat
-from traitlets.config import Config
-from nbconvert.exporters import RSTExporter
-from nbconvert.preprocessors import (
-    ExecutePreprocessor,
-    ExtractOutputPreprocessor
-)
+from nbconvert.preprocessors import ExecutePreprocessor
 
 
 def main(arglist):
@@ -28,7 +25,7 @@ def main(arglist):
     # Filter to only ipython notebook fikes
     nb_paths = [
         arg for arg in args.files
-        if arg.endswith(".ipynb") and "/student/" not in arg
+        if arg.endswith(".ipynb") and "student/" not in arg
     ]
     if not nb_paths:
         print("No notebook files found")
@@ -60,6 +57,7 @@ def main(arglist):
         try:
             executor.preprocess(nb)
         except Exception as err:
+            # Log the error, but then continue
             errors[nb_path] = err
         else:
             notebooks[nb_path] = nb
@@ -72,9 +70,15 @@ def main(arglist):
     # TODO Check notebook name format?
     # (If implemented, update the CI workflow to only run on tutorials)
 
-    # Remove solution code from notebooks and write out a "student" version
+    # Post-process notebooks to remove solution code and write both versions
     for nb_path, nb in notebooks.items():
 
+        # Write out the executed version of the original notebooks
+        print(f"Writing complete notebook to {nb_path}")
+        with open(nb_path, "w") as f:
+            nbformat.write(nb, f)
+
+        # Extract components of the notebook path
         nb_dir, nb_fname = os.path.split(nb_path)
         nb_name, _ = os.path.splitext(nb_fname)
 
@@ -98,55 +102,42 @@ def main(arglist):
             with open(fname, "wb") as f:
                 f.write(imdata)
 
-        # Write out the executed version of the original notebook
-        with open(nb_path, "w") as f:
-            nbformat.write(nb, f)
-
     exit(errors)
 
 
 def remove_solutions(nb, nb_name):
     """Convert solution cells to markdown; embed images from Python output."""
 
-    # -- Extract image data from the cell outputs
-    c = Config()
-    template = (
-        f"../static/{nb_name}"
-        "_Solution_{cell_index}_{index}{extension}"
-    )
-    c.ExtractOutputPreprocessor.output_filename_template = template
-
-    # Note: using the RST exporter means we need to install pandoc as a dep
-    # in the github workflow, which adds a little bit of latency, and we don't
-    # actually care about the RST output. It's just a convenient way to get the
-    # image resources the way we want them.
-    exporter = RSTExporter()
-    extractor = ExtractOutputPreprocessor(config=c)
-    exporter.register_preprocessor(extractor, True)
-    _, resources = exporter.from_notebook_node(nb)
-
-    # -- Convert solution cells to markdown with embedded image
-    nb_cells = nb.get("cells", [])
-    outputs = resources["outputs"]
     solution_resources = {}
-
+    nb_cells = nb.get("cells", [])
     for i, cell in enumerate(nb_cells):
-        cell_text = cell["source"].replace(" ", "").lower()
-        if cell_text.startswith("#@titlesolution"):
 
-            # Just remove solution cells that generate no outputs
+        if has_solution(cell):
+
+            # Simply remove solution cells without outputs
+
             if not cell["outputs"]:
                 nb_cells.remove(cell)
                 continue
 
-            # Filter the resources for solution images
-            image_paths = [k for k in outputs if f"Solution_{i}" in k]
-            solution_resources.update({k: outputs[k] for k in image_paths})
+            # Extract image data from the cell outputs and assign a unique
+            # filename based on the cell source (not index, which can change)
 
-            # Conver the solution cell to markdown, strip the source,
+            cell_source = cell["source"].encode("utf-8")
+            cell_id = hashlib.sha1(cell_source).hexdigest()[:8]
+            cell_images = []
+
+            for j, output in enumerate(cell["outputs"]):
+
+                fname = f"../static/{nb_name}_Solution_{cell_id}_{j}.png"
+                image_data = a2b_base64(output.data["image/png"])
+                solution_resources[fname] = image_data
+                cell_images.append(fname)
+
+            # Convert the solution cell to markdown, strip the source,
             # and embed the image as a link to static resource
             new_source = "**Example output:**\n\n" + "\n\n".join([
-                f"<img src='{f}' align='left'>" for f in image_paths
+                f"<img src='{f}' align='left'>" for f in cell_images
             ])
             cell["source"] = new_source
             cell["cell_type"] = "markdown"
@@ -154,6 +145,16 @@ def remove_solutions(nb, nb_name):
             del cell["execution_count"]
 
     return nb, solution_resources
+
+
+def has_solution(cell):
+    """Return True if cell is marked as containing an exercise solution."""
+    cell_text = cell["source"].replace(" ", "").lower()
+    first_line = cell_text.split("\n")[0]
+    return (
+        cell_text.startswith("#@titlesolution")
+        or "to_remove" in first_line
+    )
 
 
 def sequentially_executed(nb):
